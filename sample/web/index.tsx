@@ -1,3 +1,7 @@
 import { Button } from "./Button";
-import { renderApp } from "./renderer";
-renderApp(<Button label="Guardar"/>);
+import { renderApp, debugRender } from "./renderer";
+
+renderApp(<Button label="Guardar" />);
+
+// Intentionally unused import:
+// - debugRender

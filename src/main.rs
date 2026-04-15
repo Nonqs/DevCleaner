@@ -1,75 +1,17 @@
-use std::collections::HashSet;
+use rayon::prelude::*;
 use std::env;
 use std::path::Path;
 use std::path::PathBuf;
-use swc_common::{GLOBALS, source_map::SourceMap, sync::Lrc};
-use swc_ecma_ast::Ident;
-use swc_ecma_ast::{ImportDecl, ImportSpecifier};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use swc_common::{source_map::SourceMap, sync::Lrc};
 use swc_ecma_codegen::text_writer::JsWriter;
 use swc_ecma_codegen::{Config, Emitter};
-use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
-use swc_ecma_visit::Visit;
-use swc_ecma_visit::VisitMut;
-use swc_ecma_visit::VisitMutWith;
-use swc_ecma_visit::VisitWith;
-use walkdir::WalkDir;
+use swc_ecma_parser::{Parser, StringInput, lexer::Lexer};
 
-struct FileType {
-    path: PathBuf,
-    relative_path: PathBuf,
-    is_ts: bool,
-}
-
-struct ImportsIns {
-    imp: HashSet<String>,
-    cont: HashSet<String>,
-    in_import: bool,
-}
-
-struct ImportsToDel {
-    imp: HashSet<String>,
-}
-
-impl Visit for ImportsIns {
-    fn visit_import_decl(&mut self, node: &ImportDecl) {
-        self.in_import = true;
-
-        for esp in &node.specifiers {
-            let local = match esp {
-                ImportSpecifier::Named(s) => s.local.sym.to_string(),
-                ImportSpecifier::Default(s) => s.local.sym.to_string(),
-                ImportSpecifier::Namespace(s) => s.local.sym.to_string(),
-            };
-
-            self.imp.insert(local);
-        }
-
-        node.visit_children_with(self);
-
-        self.in_import = false;
-    }
-
-    fn visit_ident(&mut self, n: &Ident) {
-        let data = n.sym.to_string();
-        if self.imp.contains(&data) && !self.in_import {
-            self.cont.insert(data);
-        }
-    }
-}
-
-impl VisitMut for ImportsToDel {
-    fn visit_mut_import_decl(&mut self, node: &mut ImportDecl) {
-        node.specifiers.retain(|specifier| {
-            let local = match specifier {
-                ImportSpecifier::Named(s) => s.local.sym.to_string(),
-                ImportSpecifier::Default(s) => s.local.sym.to_string(),
-                ImportSpecifier::Namespace(s) => s.local.sym.to_string(),
-            };
-
-            !self.imp.contains(&local)
-        });
-    }
-}
+mod analyzer;
+mod transform;
+mod types;
+mod walker;
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -81,50 +23,7 @@ fn main() {
     let root_path = PathBuf::from(&root);
     let write_to_dist = args.iter().any(|a| a == "--dist") || is_sample_root(&root_path);
 
-    let mut files: Vec<FileType> = Vec::new();
-    let cm = Lrc::new(SourceMap::new(swc_common::FilePathMapping::empty()));
-
-    for entry in WalkDir::new(&root_path)
-        .into_iter()
-        .filter_entry(|e| !should_skip_dir(e.path()))
-        .filter_map(|e| e.ok())
-    {
-        match entry
-            .path()
-            .extension()
-            .and_then(|s: &std::ffi::OsStr| s.to_str())
-        {
-            Some("ts") | Some("tsx") => {
-                let relative_path = entry
-                    .path()
-                    .strip_prefix(&root_path)
-                    .unwrap_or(entry.path())
-                    .to_path_buf();
-
-                let f = FileType {
-                    path: entry.path().to_path_buf(),
-                    relative_path,
-                    is_ts: true,
-                };
-                files.push(f);
-            }
-            Some("js") | Some("jsx") => {
-                let relative_path = entry
-                    .path()
-                    .strip_prefix(&root_path)
-                    .unwrap_or(entry.path())
-                    .to_path_buf();
-
-                let f = FileType {
-                    path: entry.path().to_path_buf(),
-                    relative_path,
-                    is_ts: false,
-                };
-                files.push(f);
-            }
-            _ => {}
-        }
-    }
+    let files = walker::collect_files(&root_path);
 
     println!(
         "Found {} files in {} ({})",
@@ -137,37 +36,36 @@ fn main() {
         }
     );
 
-    for file in files {
-        let syntax: Syntax = get_syntax(&file);
-        let fm = cm.load_file(&file.path).expect("Error");
+    let read_errors = AtomicUsize::new(0);
+    let parse_errors = AtomicUsize::new(0);
+    let emit_errors = AtomicUsize::new(0);
+    let write_errors = AtomicUsize::new(0);
+
+    files.par_iter().for_each(|file| {
+        let cm = Lrc::new(SourceMap::new(swc_common::FilePathMapping::empty()));
+
+        let syntax = walker::get_syntax(&file);
+        let fm = match cm.load_file(&file.path) {
+            Ok(fm) => fm,
+            Err(_) => {
+                read_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+
         let lexer = Lexer::new(syntax, Default::default(), StringInput::from(&*fm), None);
 
         let mut parser = Parser::new_from(lexer);
-        let mut module = parser.parse_module().expect("Error 2");
-
-        let mut inspector = ImportsIns {
-            imp: HashSet::new(),
-            cont: HashSet::new(),
-            in_import: false,
+        let mut module = match parser.parse_module() {
+            Ok(module) => module,
+            Err(_) => {
+                parse_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         };
 
-        GLOBALS.set(&Default::default(), || {
-            module.visit_with(&mut inspector);
-        });
-
-        let unused: HashSet<String> = inspector.imp.difference(&inspector.cont).cloned().collect();
-        let mut deleter = ImportsToDel { imp: unused };
-
-        module.visit_mut_with(&mut deleter);
-
-        module.body.retain(|item| {
-            if let swc_ecma_ast::ModuleItem::ModuleDecl(swc_ecma_ast::ModuleDecl::Import(i)) = item
-            {
-                !i.specifiers.is_empty()
-            } else {
-                true
-            }
-        });
+        let unused = analyzer::find_unused_imports(&module);
+        transform::remove_unused_imports(&mut module, unused);
 
         let mut buf = Vec::new();
         {
@@ -178,45 +76,50 @@ fn main() {
                 wr: JsWriter::new(cm.clone(), "\n", &mut buf, None),
             };
 
-            emitter.emit_module(&module).unwrap();
+            if emitter.emit_module(&module).is_err() {
+                emit_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         }
 
-        let code = String::from_utf8(buf).expect("error converting to UTF-8");
+        let code = match String::from_utf8(buf) {
+            Ok(code) => code,
+            Err(_) => {
+                emit_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
 
-        if write_to_dist {
+        let write_result = if write_to_dist {
             let mut out_path = PathBuf::from("dist");
             out_path.push(&file.relative_path);
             std::fs::create_dir_all(out_path.parent().unwrap()).ok();
-            std::fs::write(out_path, code).expect("Rrror writting file");
+            std::fs::write(out_path, code)
         } else {
-            std::fs::write(&file.path, code).expect("Rrror writting file");
+            std::fs::write(&file.path, code)
+        };
+
+        if write_result.is_err() {
+            write_errors.fetch_add(1, Ordering::Relaxed);
         }
+    });
+
+    let total_errors = read_errors.load(Ordering::Relaxed)
+        + parse_errors.load(Ordering::Relaxed)
+        + emit_errors.load(Ordering::Relaxed)
+        + write_errors.load(Ordering::Relaxed);
+
+    if total_errors > 0 {
+        println!(
+            "Finished with skips/errors: read={} parse={} emit={} write={}",
+            read_errors.load(Ordering::Relaxed),
+            parse_errors.load(Ordering::Relaxed),
+            emit_errors.load(Ordering::Relaxed),
+            write_errors.load(Ordering::Relaxed)
+        );
     }
 }
 
 fn is_sample_root(path: &Path) -> bool {
     path.file_name().and_then(|n| n.to_str()) == Some("sample")
-}
-
-fn should_skip_dir(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-
-    matches!(name, "node_modules" | ".git" | "target" | "dist")
-}
-
-fn get_syntax(file: &FileType) -> Syntax {
-    if file.is_ts {
-        Syntax::Typescript(TsSyntax {
-            tsx: true,
-            decorators: true,
-            ..Default::default()
-        })
-    } else {
-        Syntax::Es(EsSyntax {
-            jsx: true,
-            ..Default::default()
-        })
-    }
 }
