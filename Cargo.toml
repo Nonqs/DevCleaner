@@ -1,7 +1,10 @@
 [package]
-name = "DevCleaner"
+name = "dev_cleaner"
 version = "0.1.0"
 edition = "2024"
+description = "Removes unused imports from TS/JS files"
+license = "MIT"
+repository = "https://github.com/Nonqs/DevCleaner"
 
 [dependencies]
 rayon = "1.12.0"

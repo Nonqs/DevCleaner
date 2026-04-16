@@ -3,19 +3,6 @@
 version = 4
 
 [[package]]
-name = "DevCleaner"
-version = "0.1.0"
-dependencies = [
- "rayon",
- "swc_common",
- "swc_ecma_ast",
- "swc_ecma_codegen",
- "swc_ecma_parser",
- "swc_ecma_visit",
- "walkdir",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -182,6 +169,19 @@ name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+
+[[package]]
+name = "dev_cleaner"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+ "swc_common",
+ "swc_ecma_ast",
+ "swc_ecma_codegen",
+ "swc_ecma_parser",
+ "swc_ecma_visit",
+ "walkdir",
+]
 
 [[package]]
 name = "displaydoc"
