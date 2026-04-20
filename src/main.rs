@@ -4,8 +4,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use swc_common::{source_map::SourceMap, sync::Lrc};
-use swc_ecma_codegen::text_writer::JsWriter;
-use swc_ecma_codegen::{Config, Emitter};
 use swc_ecma_parser::{Parser, StringInput, lexer::Lexer};
 
 mod analyzer;
@@ -38,7 +36,6 @@ fn main() {
 
     let read_errors = AtomicUsize::new(0);
     let parse_errors = AtomicUsize::new(0);
-    let emit_errors = AtomicUsize::new(0);
     let write_errors = AtomicUsize::new(0);
 
     files.par_iter().for_each(|file| {
@@ -56,7 +53,7 @@ fn main() {
         let lexer = Lexer::new(syntax, Default::default(), StringInput::from(&*fm), None);
 
         let mut parser = Parser::new_from(lexer);
-        let mut module = match parser.parse_module() {
+        let module = match parser.parse_module() {
             Ok(module) => module,
             Err(_) => {
                 parse_errors.fetch_add(1, Ordering::Relaxed);
@@ -64,31 +61,14 @@ fn main() {
             }
         };
 
+        let source = fm.src.to_string();
         let unused = analyzer::find_unused_imports(&module);
-        transform::remove_unused_imports(&mut module, unused);
+        let edits = transform::build_text_edits(&unused, &source, fm.start_pos);
+        let code = transform::apply_text_edits(&source, &edits);
 
-        let mut buf = Vec::new();
-        {
-            let mut emitter = Emitter {
-                cfg: Config::default(),
-                cm: cm.clone(),
-                comments: None,
-                wr: JsWriter::new(cm.clone(), "\n", &mut buf, None),
-            };
-
-            if emitter.emit_module(&module).is_err() {
-                emit_errors.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
+        if !write_to_dist && code == source {
+            return;
         }
-
-        let code = match String::from_utf8(buf) {
-            Ok(code) => code,
-            Err(_) => {
-                emit_errors.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        };
 
         let write_result = if write_to_dist {
             let mut out_path = PathBuf::from("dist");
@@ -106,15 +86,13 @@ fn main() {
 
     let total_errors = read_errors.load(Ordering::Relaxed)
         + parse_errors.load(Ordering::Relaxed)
-        + emit_errors.load(Ordering::Relaxed)
         + write_errors.load(Ordering::Relaxed);
 
     if total_errors > 0 {
         println!(
-            "Finished with skips/errors: read={} parse={} emit={} write={}",
+            "Finished with skips/errors: read={} parse={} write={}",
             read_errors.load(Ordering::Relaxed),
             parse_errors.load(Ordering::Relaxed),
-            emit_errors.load(Ordering::Relaxed),
             write_errors.load(Ordering::Relaxed)
         );
     }

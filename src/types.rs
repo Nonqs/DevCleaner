@@ -5,3 +5,9 @@ pub struct FileType {
     pub relative_path: PathBuf,
     pub is_ts: bool,
 }
+
+pub struct TextEdit {
+    pub start: usize,
+    pub end: usize,
+    pub replacement: String,
+}

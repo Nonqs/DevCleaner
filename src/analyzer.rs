@@ -1,28 +1,40 @@
 use std::collections::HashSet;
 
-use swc_common::GLOBALS;
+use swc_common::{GLOBALS, Span, Spanned};
 use swc_ecma_ast::Ident;
 use swc_ecma_ast::{ImportDecl, ImportSpecifier, Module};
 use swc_ecma_visit::{Visit, VisitWith};
 
-pub fn find_unused_imports(module: &Module) -> HashSet<String> {
+pub fn find_unused_imports(module: &Module) -> Vec<ImportBinding> {
     let mut inspector = ImportsIns {
-        imp: HashSet::new(),
-        cont: HashSet::new(),
+        used_names: HashSet::new(),
         in_import: false,
+        imports: Vec::new(),
     };
 
     GLOBALS.set(&Default::default(), || {
         module.visit_with(&mut inspector);
     });
 
-    inspector.imp.difference(&inspector.cont).cloned().collect()
+    let used_names = inspector.used_names;
+
+    inspector
+        .imports
+        .into_iter()
+        .filter(|binding| !used_names.contains(&binding.local_name))
+        .collect()
+}
+
+pub struct ImportBinding {
+    pub local_name: String,
+    pub specifier_span: Span,
+    pub import_decl_span: Span,
 }
 
 struct ImportsIns {
-    imp: HashSet<String>,
-    cont: HashSet<String>,
+    used_names: HashSet<String>,
     in_import: bool,
+    imports: Vec<ImportBinding>,
 }
 
 impl Visit for ImportsIns {
@@ -36,7 +48,13 @@ impl Visit for ImportsIns {
                 ImportSpecifier::Namespace(s) => s.local.sym.to_string(),
             };
 
-            self.imp.insert(local);
+            let n = ImportBinding {
+                local_name: local.clone(),
+                specifier_span: esp.span(),
+                import_decl_span: node.span,
+            };
+
+            self.imports.push(n);
         }
 
         node.visit_children_with(self);
@@ -46,8 +64,8 @@ impl Visit for ImportsIns {
 
     fn visit_ident(&mut self, n: &Ident) {
         let data = n.sym.to_string();
-        if self.imp.contains(&data) && !self.in_import {
-            self.cont.insert(data);
+        if !self.in_import {
+            self.used_names.insert(data);
         }
     }
 }
